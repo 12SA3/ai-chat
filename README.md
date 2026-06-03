@@ -203,27 +203,6 @@ wzh-AI/
 - 通过滚动距离阈值判断（< 100px）
 - 在 flush 阶段触发滚动，降低频率
 
-## 技术细节
-
-### 为什么使用 fetch + ReadableStream 而不是 WebSocket？
-
-- 数据流是单向的（服务端 → 前端），符合模型生成的业务特性
-- 无需维护复杂的连接状态，部署与调试成本更低
-- 与现有 HTTP/网关体系兼容性更好
-- ReadableStream 提供对字节级流的精细化控制
-
-### 为什么必须使用 TextDecoder？
-
-- 一个字符（尤其是中文）可能被拆分到多个 chunk 中
-- 直接拼接字节或一次性 decode 会出现乱码
-- `{ stream: true }` 确保跨 chunk 字符正确还原
-
-### 为什么需要节奏控制？
-
-- 避免渲染频率直接受网络和模型输出节奏影响
-- 提供稳定的视觉体验
-- 降低滚动和重绘频率，提升性能
-
 ## API 接口
 
 ### POST /api/chat
@@ -290,41 +269,6 @@ const requestBody = {
 };
 ```
 
-## 常见问题
-
-### 如何更换 AI 服务提供商？
-
-修改 `server.js` 中的 API 配置：
-
-```javascript
-const options = {
-  hostname: "your-api-host.com",
-  port: 443,
-  path: "/v1/chat/completions",
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${API_KEY}`,
-  },
-};
-```
-
-### 如何调整流式输出速度？
-
-在 `src/services/streamParser.js` 中调整：
-
-- `flushInterval` 的间隔时间
-- `chunkSize` 的大小
-
-### 如何添加更多预设问题？
-
-编辑 `src/components/Main/Main.jsx` 中的卡片内容：
-
-```javascript
-<div className="card" onClick={() => onSent("你的问题")}>
-  <p>你的问题</p>
-  <img src={assets.icon} alt="" />
-</div>
-```
 
 ## 许可证
 
