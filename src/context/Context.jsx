@@ -1,5 +1,6 @@
 import { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import streamParser from "../services/streamParser";
+import { executeTool, buildAgentSystemPrompt } from "../services/toolRegistry";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
 
 export const Context = createContext();
@@ -140,6 +141,8 @@ const ContextProvider = (props) => {
       }
 
       const normalizedText = messageText.trim();
+
+      // ====== 1. 创建用户消息 ======
       const userMessage = {
         id: Date.now(),
         role: "user",
@@ -147,9 +150,9 @@ const ContextProvider = (props) => {
         timestamp: new Date().toLocaleString()
       };
 
-      const nextMessages = [...messages, userMessage];
-      setMessages(nextMessages);
-      updateSessionMessages(nextMessages, { showResult: true, input: "", isGenerating: true });
+      let uiMessages = [...messages, userMessage];
+      setMessages(uiMessages);
+      updateSessionMessages(uiMessages, { showResult: true, input: "", isGenerating: true });
       setInput("");
       setShowResult(true);
       setIsGenerating(true);
@@ -157,97 +160,232 @@ const ContextProvider = (props) => {
       setRecentPrompt(normalizedText);
       setIsAtBottom(true);
 
-      const aiMessage = {
-        id: Date.now() + 1,
-        role: "assistant",
-        content: "",
-        timestamp: new Date().toLocaleString(),
-        status: "generating"
-      };
+      // ====== 2. 构建 API 消息（加入 Agent system prompt） ======
+      const buildApiMessages = (uiMsgs) =>
+        uiMsgs
+          .filter((m) => m.role !== "system")
+          .map((m) => {
+            const apiMsg = { role: m.role, content: m.content };
+            if (m.toolCalls) {
+              apiMsg.tool_calls = m.toolCalls;
+            }
+            if (m.role === "tool") {
+              apiMsg.tool_call_id = m.tool_call_id;
+            }
+            return apiMsg;
+          });
 
-      const messagesWithAI = [...nextMessages, aiMessage];
-      setMessages(messagesWithAI);
-      updateSessionMessages(messagesWithAI, { showResult: true, input: "", isGenerating: true });
+      // 初始 API 消息：Agent system prompt + 历史消息
+      let apiMessages = [
+        { role: "system", content: buildAgentSystemPrompt() },
+        ...buildApiMessages(uiMessages),
+      ];
+      let accumulatedContent = "";
 
-      try {
-        const apiMessages = nextMessages.map((message) => ({
-          role: message.role,
-          content: message.content
-        }));
+      // ====== 3. Agent 循环 ======
+      const MAX_ITERATIONS = 5; // 安全上限
+      let iteration = 0;
 
-        await streamParser.fetchStream(
-          apiMessages,
-          (chunk) => {
-            let streamedContent = "";
-            const updatedMessages = messagesWithAI.map((message) => {
-              if (message.id !== aiMessage.id) {
-                return message;
+      while (iteration < MAX_ITERATIONS) {
+        iteration++;
+
+        // 为本轮创建 AI 消息 placeholder
+        const aiMessageId = Date.now() + iteration;
+        const aiMessage = {
+          id: aiMessageId,
+          role: "assistant",
+          content: "",
+          timestamp: new Date().toLocaleString(),
+          status: "generating"
+        };
+
+        uiMessages = [...uiMessages, aiMessage];
+        setMessages(uiMessages);
+
+        // 流式文本收集（闭包内）
+        let streamedText = "";
+        let toolCalls = [];
+
+        try {
+          await streamParser.fetchStream(
+            apiMessages,
+            // onChunk
+            (chunk) => {
+              streamedText += chunk;
+              const updated = uiMessages.map((m) =>
+                m.id === aiMessageId
+                  ? { ...m, content: m.content + chunk }
+                  : m
+              );
+              uiMessages = updated;
+              setMessages(updated);
+              updateSessionMessages(updated, { resultData: streamedText });
+            },
+            // onError
+            (error) => {
+              console.error("Stream error:", error);
+              const updated = uiMessages.map((m) =>
+                m.id === aiMessageId
+                  ? { ...m, status: "failed", content: m.content || "生成失败，请重试" }
+                  : m
+              );
+              uiMessages = updated;
+              setMessages(updated);
+            },
+            // onComplete — 解析 tool calls（优先原生，fallback 到 prompt-based）
+            (completedToolCalls) => {
+              // 先检查是否有原生 tool_calls（OpenAI 格式）
+              if (completedToolCalls && completedToolCalls.length > 0) {
+                toolCalls = completedToolCalls;
+                return;
               }
 
-              streamedContent = `${message.content}${chunk}`;
-              return {
-                ...message,
-                content: streamedContent
-              };
-            });
-
-            messagesWithAI.splice(0, messagesWithAI.length, ...updatedMessages);
-            setMessages(updatedMessages);
-            updateSessionMessages(updatedMessages, { resultData: streamedContent });
-          },
-          (error) => {
-            console.error("Stream error:", error);
-            const errorMessages = messagesWithAI.map((message) =>
-              message.id === aiMessage.id
-                ? {
-                    ...message,
-                    status: "failed",
-                    content: message.content || "生成失败，请重试"
-                  }
-                : message
-            );
-            setMessages(errorMessages);
-            updateSessionMessages(errorMessages, { isGenerating: false });
-            setIsGenerating(false);
-            setLoading(false);
-          },
-          () => {
-            let completedContent = "";
-            const completedMessages = messagesWithAI.map((message) => {
-              if (message.id !== aiMessage.id) {
-                return message;
+              // Fallback: 从文本中解析 prompt-based 工具调用
+              // 格式: {"tool": "工具名", "args": {...}}
+              const toolCallRegex = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[^}]*\})\s*\}/g;
+              let match;
+              while ((match = toolCallRegex.exec(streamedText)) !== null) {
+                try {
+                  const toolName = match[1];
+                  const args = JSON.parse(match[2]);
+                  toolCalls.push({
+                    id: `call_${Date.now()}_${toolCalls.length}`,
+                    type: "function",
+                    function: {
+                      name: toolName,
+                      arguments: JSON.stringify(args),
+                    },
+                  });
+                } catch {
+                  // 解析失败，跳过
+                }
               }
+            },
+            true  // agentMode: server 不自动注入 RAG，Agent 自主调用工具
+          );
+        } catch (error) {
+          console.error("Agent loop error:", error);
+          const updated = uiMessages.map((m) =>
+            m.id === aiMessageId
+              ? { ...m, status: "failed", content: "生成失败，请重试" }
+              : m
+          );
+          setMessages(updated);
+          updateSessionMessages(updated, { isGenerating: false });
+          setIsGenerating(false);
+          setLoading(false);
+          return;
+        }
 
-              completedContent = message.content;
-              return {
-                ...message,
-                status: "completed",
-                content: message.content
-              };
+        // 检查是否有 tool_calls
+        if (toolCalls.length > 0) {
+          // 清理文本中的工具调用 JSON（不显示给用户）
+          let cleanText = streamedText.replace(
+            /\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]+\}\s*\}/g,
+            ""
+          ).trim();
+
+          const toolNames = toolCalls.map((tc) => tc.function.name).join(", ");
+          uiMessages = uiMessages.map((m) =>
+            m.id === aiMessageId
+              ? {
+                  ...m,
+                  content: cleanText || `🔧 正在调用工具: ${toolNames}`,
+                  status: "tool_use",
+                  toolCalls: toolCalls
+                }
+              : m
+          );
+          setMessages(uiMessages);
+
+          // 追加 assistant 回复到 API 消息（含工具调用 JSON）
+          apiMessages.push({
+            role: "assistant",
+            content: streamedText,
+          });
+
+          // 执行工具，将结果以 user 消息形式追加（prompt-based 兼容）
+          for (const tc of toolCalls) {
+            let result;
+            try {
+              result = await executeTool(tc.function.name, tc.function.arguments);
+            } catch (err) {
+              result = JSON.stringify({ error: `工具执行失败: ${err.message}` });
+            }
+
+            // 以 user 消息形式发送工具结果
+            apiMessages.push({
+              role: "user",
+              content: `[工具 ${tc.function.name} 的执行结果]\n${result}`,
             });
 
-            setMessages(completedMessages);
-            updateSessionMessages(completedMessages, {
-              resultData: completedContent,
-              isGenerating: false
-            });
-            setIsGenerating(false);
-            setLoading(false);
-            setResultData(completedContent);
+            // 在 UI 中显示工具调用结果（可选：折叠展示）
+            let toolResultPreview = result;
+            try {
+              const parsed = JSON.parse(result);
+              if (parsed.results) {
+                toolResultPreview = `📚 找到 ${parsed.results.length} 条相关结果`;
+              } else if (parsed.result !== undefined) {
+                toolResultPreview = `🧮 ${tc.function.arguments.expression} = ${parsed.result}`;
+              } else if (parsed.datetime) {
+                toolResultPreview = `🕐 ${parsed.datetime}`;
+              }
+            } catch {
+              toolResultPreview = result.substring(0, 100);
+            }
+
+            const toolMsg = {
+              id: Date.now() + iteration + Math.random(),
+              role: "tool",
+              tool_call_id: tc.id,
+              tool_name: tc.function.name,
+              content: toolResultPreview,
+              timestamp: new Date().toLocaleString()
+            };
+            uiMessages.push(toolMsg);
           }
+
+          // 更新 UI
+          setMessages([...uiMessages]);
+          accumulatedContent = streamedText || accumulatedContent;
+
+          // 继续循环 — 模型基于工具结果再次推理
+          continue;
+        }
+
+        // 没有 tool_calls — 这是最终回答
+        uiMessages = uiMessages.map((m) =>
+          m.id === aiMessageId
+            ? { ...m, status: "completed", content: streamedText }
+            : m
         );
-      } catch (error) {
-        console.error("Error:", error);
-        const errorMessages = messagesWithAI.map((message) =>
-          message.id === aiMessage.id
-            ? { ...message, status: "failed", content: "生成失败，请重试" }
-            : message
-        );
-        setMessages(errorMessages);
-        updateSessionMessages(errorMessages, { isGenerating: false });
+        setMessages(uiMessages);
+
+        const finalContent = accumulatedContent + streamedText || streamedText;
+        updateSessionMessages(uiMessages, {
+          resultData: finalContent,
+          isGenerating: false
+        });
         setIsGenerating(false);
         setLoading(false);
+        setResultData(finalContent);
+        return;
       }
+
+      // 超过最大迭代次数
+      const lastMsg = uiMessages[uiMessages.length - 1];
+      if (lastMsg && lastMsg.status === "generating") {
+        uiMessages = uiMessages.map((m) =>
+          m.id === lastMsg.id ? { ...m, status: "completed" } : m
+        );
+      }
+      setMessages(uiMessages);
+      updateSessionMessages(uiMessages, {
+        isGenerating: false,
+        resultData: accumulatedContent
+      });
+      setIsGenerating(false);
+      setLoading(false);
     },
     [input, isGenerating, messages, updateSessionMessages]
   );

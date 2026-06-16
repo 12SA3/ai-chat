@@ -5,30 +5,47 @@ import { assets } from "../../assets/assets";
 import { Context } from "../../context/Context";
 import MarkdownRenderer from "../MarkdownRenderer/MarkdownRenderer";
 
-const MessageRow = ({ message }) => (
-  <div className={`message-item ${message.role === "assistant" ? "ai-message" : "user-message"}`}>
-    <img
-      src={message.role === "assistant" ? assets.gemini_icon : assets.user_icon}
-      alt=""
-      className="message-avatar"
-    />
-    <div className="message-content">
-      {message.status === "generating" && !message.content ? (
-        <div className="loader">
-          <hr />
-          <hr />
-          <hr />
+const MessageRow = ({ message }) => {
+  // 工具结果消息使用特殊样式
+  if (message.role === "tool") {
+    return (
+      <div className="message-item tool-message">
+        <div className="message-content">
+          <div className="tool-result">
+            <span className="tool-icon">🔧</span>
+            <span className="tool-label">{message.content}</span>
+          </div>
         </div>
-      ) : (
-        <div className="markdown-content">
-          <MarkdownRenderer content={message.content} />
-        </div>
-      )}
-      {message.status === "aborted" && <span className="message-status">已中断</span>}
-      {message.status === "failed" && <span className="message-status error">生成失败</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`message-item ${message.role === "assistant" ? "ai-message" : "user-message"}`}>
+      <img
+        src={message.role === "assistant" ? assets.gemini_icon : assets.user_icon}
+        alt=""
+        className="message-avatar"
+      />
+      <div className="message-content">
+        {message.status === "generating" && !message.content ? (
+          <div className="loader">
+            <hr />
+            <hr />
+            <hr />
+          </div>
+        ) : (
+          <div className="markdown-content">
+            <MarkdownRenderer content={message.content} />
+          </div>
+        )}
+        {message.status === "aborted" && <span className="message-status">已中断</span>}
+        {message.status === "failed" && <span className="message-status error">生成失败</span>}
+        {message.status === "tool_use" && <span className="message-status tool-status">调用工具中...</span>}
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 const Main = () => {
   const {
