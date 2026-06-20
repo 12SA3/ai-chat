@@ -4,13 +4,14 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 import knowledgeService from './src/services/knowledgeService.js';
+import memoryService from './src/services/memoryService.js';
 
 dotenv.config();
 
 const API_KEY = process.env.XUNFEI_API_KEY;
 const PORT = process.env.PORT || 3001;
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -42,9 +43,21 @@ const server = http.createServer((req, res) => {
         // RAG 策略：
         // - Agent 模式：让 Agent 自主决定是否搜索知识库，不自动注入
         // - 普通模式：自动注入知识库上下文
-        const systemPrompt = (!agentMode && query)
-          ? knowledgeService.buildSystemPrompt(query)
+        let systemPrompt = (!agentMode && query)
+          ? await knowledgeService.buildSystemPrompt(query)
           : null;
+
+        // 长期记忆：自动召回相关记忆
+        const memories = query ? await memoryService.recall(query, 5) : [];
+        if (memories.length > 0) {
+          const memText = memoryService.buildMemoryPrompt(memories);
+          if (systemPrompt) {
+            // 追加到已有 system prompt 后面
+            systemPrompt = systemPrompt + "\n" + memText;
+          }
+          console.log(`[Memory] 召回了 ${memories.length} 条记忆`);
+        }
+
         if (systemPrompt) {
           console.log('[RAG] 已注入知识库上下文');
         } else if (agentMode) {
@@ -63,14 +76,38 @@ const server = http.createServer((req, res) => {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ status: 'ok', message: 'AI Chat API is running' }));
-  } else if (req.method === 'POST' && req.url === '/api/knowledge/load') {
-    // 加载文档到知识库
+  } else if (req.method === 'POST' && req.url === '/api/memory/remember') {
+    // 写入长期记忆
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
+      try {
+        const { key, content, type } = JSON.parse(body);
+        await memoryService.remember(key, content, type || 'preference');
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: true }));
+      } catch (error) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: error.message }));
+      }
+    });
+  } else if (req.method === 'GET' && req.url.startsWith('/api/memory/recall')) {
+    // 召回长期记忆
+    const url = new URL(req.url, 'http://localhost');
+    const q = url.searchParams.get('q') || '';
+    const memories = await memoryService.recall(q, 5);
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ query: q, memories }));
+  } else if (req.method === 'POST' && req.url === '/api/knowledge/load') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
       try {
         const { title, content } = JSON.parse(body);
-        const result = knowledgeService.loadDocument(title, content);
+        const result = await knowledgeService.loadDocument(title, content);
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ success: true, ...result }));
@@ -81,15 +118,14 @@ const server = http.createServer((req, res) => {
       }
     });
   } else if (req.method === 'GET' && req.url === '/api/knowledge/documents') {
-    // 列出已加载的文档
+    const docs = await knowledgeService.listDocuments();
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ documents: knowledgeService.listDocuments() }));
+    res.end(JSON.stringify({ documents: docs }));
   } else if (req.method === 'GET' && req.url.startsWith('/api/knowledge/search')) {
-    // 测试用: 直接搜索知识库 (GET /api/knowledge/search?q=关键词)
     const url = new URL(req.url, 'http://localhost');
     const q = url.searchParams.get('q') || '';
-    const results = knowledgeService.search(q, 5);
+    const results = await knowledgeService.search(q, 5);
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ query: q, results }));
@@ -167,22 +203,38 @@ function handleStreamRequest(messages, res, systemPrompt = null) {
   console.log('请求已发送');
 }
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 
-  // 启动时自动加载知识库文档
-  const knowledgeDir = path.join(process.cwd(), 'knowledge-base');
-  if (fs.existsSync(knowledgeDir)) {
-    const files = fs.readdirSync(knowledgeDir).filter(f => f.endsWith('.md'));
-    for (const file of files) {
-      try {
-        const content = fs.readFileSync(path.join(knowledgeDir, file), 'utf-8');
-        const title = file.replace('.md', '');
-        knowledgeService.loadDocument(title, content);
-        console.log(`[知识库] 已自动加载: ${file}`);
-      } catch (err) {
-        console.error(`[知识库] 加载失败: ${file}`, err.message);
+  // 初始化 LanceDB
+  await knowledgeService.init();
+
+  // 初始化长期记忆
+  await memoryService.init();
+
+  // 启用 LLM Re-rank（使用讯飞 API 做 Cross-encoder 精排）
+  if (API_KEY) {
+    knowledgeService.setReranker(API_KEY);
+  }
+
+  // 仅在首次运行时加载文档（LanceDB 持久化，重启不丢失）
+  const stats = await knowledgeService.getStats();
+  if (stats.totalChunks === 0) {
+    console.log('[知识库] 首次运行，加载文档...');
+    const knowledgeDir = path.join(process.cwd(), 'knowledge-base');
+    if (fs.existsSync(knowledgeDir)) {
+      const files = fs.readdirSync(knowledgeDir).filter(f => f.endsWith('.md'));
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(path.join(knowledgeDir, file), 'utf-8');
+          const title = file.replace('.md', '');
+          await knowledgeService.loadDocument(title, content);
+        } catch (err) {
+          console.error(`[知识库] 加载失败: ${file}`, err.message);
+        }
       }
     }
+  } else {
+    console.log(`[知识库] 已有 ${stats.totalChunks} 个分块，跳过加载`);
   }
 });

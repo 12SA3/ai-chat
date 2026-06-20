@@ -63,6 +63,33 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "remember",
+      description:
+        "记住用户告诉你的重要信息，以便在未来的对话中使用。当用户明确说'记住...''以后叫我...''别忘了...'，或主动透露个人信息、偏好、习惯时，调用此工具将信息存入长期记忆。",
+      parameters: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            description: "简短标签，如'用户姓名''回答风格偏好''职业'",
+          },
+          content: {
+            type: "string",
+            description: "要记住的完整内容，包含上下文",
+          },
+          type: {
+            type: "string",
+            enum: ["preference", "fact", "correction"],
+            description: "记忆类型：preference=偏好, fact=事实, correction=用户纠正了你的错误",
+          },
+        },
+        required: ["key", "content"],
+      },
+    },
+  },
 ];
 
 // ─── 工具执行函数 ────────────────────────────────────────
@@ -160,13 +187,61 @@ async function searchKnowledgeBase(args = {}) {
   }
 }
 
+/**
+ * 写入长期记忆 — 通过后端 API
+ */
+async function rememberFact(args = {}) {
+  const key = args.key || "";
+  const content = args.content || "";
+  const type = args.type || "preference";
+
+  if (!key.trim() || !content.trim()) {
+    return { error: "记忆的 key 和 content 不能为空" };
+  }
+
+  try {
+    const response = await fetch("http://localhost:3001/api/memory/remember", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key.trim(), content: content.trim(), type }),
+    });
+
+    if (!response.ok) {
+      return { error: `记忆保存失败: HTTP ${response.status}` };
+    }
+
+    const data = await response.json();
+    return { success: true, message: `已记住: ${key}`, ...data };
+  } catch (err) {
+    return { error: `记忆服务连接失败: ${err.message}` };
+  }
+}
+
 // ─── Agent System Prompt 生成 ────────────────────────────
 
 /**
  * 构建 Agent 模式的 system prompt
  * 教模型用特定 JSON 格式输出函数调用，兼容不支持原生 tools 的 API
+ * @param {Array} activeSkills - 按需加载的 skills 列表（可选）
  */
-function buildAgentSystemPrompt() {
+function buildAgentSystemPrompt(activeSkills = [], memories = []) {
+  const skillsSection = activeSkills.length > 0
+    ? "\n" + activeSkills.map((s) => s.prompt).join("\n\n")
+    : "";
+
+  const memorySection = memories.length > 0
+    ? "\n" + [
+        "## 关于用户的长期记忆",
+        "以下是你之前记住的关于用户的信息，请在回答时参考：",
+        ...memories.map((m) => {
+          const typeTag = { preference: "偏好", fact: "事实", correction: "纠正" }[m.type] || m.type;
+          return `- [${typeTag}] ${m.key}: ${m.content}`;
+        }),
+        "",
+        "请遵循以上用户偏好，并在合适时引用这些信息。",
+      ].join("\n")
+    : "";
+
   return [
     "你是一个具备工具调用能力的智能助手。",
     "",
@@ -184,6 +259,10 @@ function buildAgentSystemPrompt() {
     "   参数: {\"query\": \"搜索关键词或问题\"}",
     "   关于小土的任何问题（个人信息、爱好、工作、经历等）**必须先调用此工具**",
     "",
+    "4. **remember** — 记住用户的重要信息（偏好/事实/纠正）",
+    "   参数: {\"key\": \"标签\", \"content\": \"完整内容\", \"type\": \"preference|fact|correction\"}",
+    "   当用户说'记住...''以后叫我...''别忘了...'或透露个人信息时调用此工具",
+    "",
     "## 调用格式",
     "当需要调用工具时，在回复中输出以下格式的 JSON（一行，单独成段）：",
     "",
@@ -193,6 +272,7 @@ function buildAgentSystemPrompt() {
     "{\"tool\": \"get_current_time\", \"args\": {}}",
     "{\"tool\": \"calculator\", \"args\": {\"expression\": \"100*24\"}}",
     "{\"tool\": \"search_knowledge_base\", \"args\": {\"query\": \"小土的生日\"}}",
+    "{\"tool\": \"remember\", \"args\": {\"key\": \"用户姓名\", \"content\": \"用户说叫他小王\", \"type\": \"preference\"}}",
     "",
     "## 重要规则",
     "- 一次只能调用一个工具",
@@ -200,6 +280,10 @@ function buildAgentSystemPrompt() {
     "- 如果不需要调用工具就直接回答，不要输出 JSON",
     "- 不要编造或猜测工具才能提供的信息",
     "- 关于小土的问题，先搜索知识库再回答",
+    "- 用户透露重要信息时，主动调用 remember 存入长期记忆",
+    "",
+    skillsSection,
+    memorySection,
   ].join("\n");
 }
 
@@ -232,6 +316,9 @@ async function executeTool(name, args = {}) {
       break;
     case "search_knowledge_base":
       result = await searchKnowledgeBase(parsedArgs);
+      break;
+    case "remember":
+      result = await rememberFact(parsedArgs);
       break;
     default:
       result = { error: `未知工具: ${name}` };

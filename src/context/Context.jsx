@@ -1,7 +1,50 @@
 import { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import streamParser from "../services/streamParser";
 import { executeTool, buildAgentSystemPrompt } from "../services/toolRegistry";
+import { matchSkills } from "../services/skills";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
+
+// ─── Token 估算 & 上下文截断（纯工具函数）────────────────────
+
+const MAX_CONTEXT_TOKENS = 6000; // 留给输入的总 token 预算
+const HISTORY_BUDGET = 4500;     // 对话历史可用 token（扣除 system prompt）
+
+function estimateTokens(messages) {
+  let total = 0;
+  for (const msg of messages) {
+    let text = "";
+    if (typeof msg.content === "string") {
+      text = msg.content;
+    } else if (msg.content) {
+      text = JSON.stringify(msg.content);
+    }
+    const chineseChars = (text.match(/[一-鿿]/g) || []).length;
+    const otherChars = text.length - chineseChars;
+    total += Math.ceil(chineseChars / 1.5) + Math.ceil(otherChars / 4);
+  }
+  return total;
+}
+
+function trimMessages(messages, maxTokens) {
+  if (messages.length <= 2) return messages;
+  const systemMsg = messages[0];
+  const history = messages.slice(1);
+  const keep = [];
+  let used = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const tokens = estimateTokens([history[i]]);
+    if (used + tokens > maxTokens) break;
+    keep.unshift(history[i]);
+    used += tokens;
+  }
+  const dropped = history.length - keep.length;
+  if (dropped > 0) {
+    console.log(
+      `[Context] 截断: ${history.length}条 → ${keep.length}条 (丢弃早期${dropped}条, 预估${used} tokens)`
+    );
+  }
+  return [systemMsg, ...keep];
+}
 
 export const Context = createContext();
 
@@ -176,8 +219,9 @@ const ContextProvider = (props) => {
           });
 
       // 初始 API 消息：Agent system prompt + 历史消息
+      const activeSkills = matchSkills(normalizedText);
       let apiMessages = [
-        { role: "system", content: buildAgentSystemPrompt() },
+        { role: "system", content: buildAgentSystemPrompt(activeSkills) },
         ...buildApiMessages(uiMessages),
       ];
       let accumulatedContent = "";
@@ -201,6 +245,15 @@ const ContextProvider = (props) => {
 
         uiMessages = [...uiMessages, aiMessage];
         setMessages(uiMessages);
+
+        // Token 估算 & 滑动窗口截断
+        const estimated = estimateTokens(apiMessages);
+        if (estimated > MAX_CONTEXT_TOKENS) {
+          console.log(
+            `[Context] Tokens: ${estimated} > ${MAX_CONTEXT_TOKENS}, 截断中...`
+          );
+          apiMessages = trimMessages(apiMessages, HISTORY_BUDGET);
+        }
 
         // 流式文本收集（闭包内）
         let streamedText = "";
